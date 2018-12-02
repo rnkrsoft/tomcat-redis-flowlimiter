@@ -1,7 +1,7 @@
 使用方法
 找到tomncat目录/conf/server.xml
 ```xml
- <Valve className="com.rnkrsoft.tomcat.flowlimit.RedisFlowLimitHandlerValve"
+ <Valve className="com.rnkrsoft.tomcat.flowlimiter.RedisFlowLimiterHandlerValve"
                 host="192.168.0.1"
                 port="6379"
                 password="password"
