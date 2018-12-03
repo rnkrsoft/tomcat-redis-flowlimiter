@@ -27,7 +27,7 @@ import java.util.Properties;
 import java.util.Set;
 
 /**
- * Created by liucheng on 2018/12/3.
+ * Created by rnkrsoft.com on 2018/12/3.
  * Redis流量限制
  */
 @Data
@@ -109,6 +109,8 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
 
     private final Properties iptables = new Properties();
 
+    private long lastIptablesModified;
+
 
     @Override
     protected void initInternal() throws LifecycleException {
@@ -134,23 +136,27 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
             } else {
                 log.error(MessageFormatter.format("please check ipdb file is '{}'?", ipdbFile.getAbsolutePath()));
             }
-        } catch (IOException e) {           log(MessageFormatter.format("please ipdb file is exists!"));
+        } catch (IOException e) {
+            log(MessageFormatter.format("please ipdb file is exists!"));
         } catch (URISyntaxException e) {
             log(MessageFormatter.format("please ipdb file is exists!"));
         }
         this.allowProvincesSet.clear();
         String[] allowProvinces0 = allowProvinces.split(";");
         for (String allowProvince : allowProvinces0) {
-            this.allowProvincesSet.add(allowProvince.trim());
+            if (!allowProvince.trim().isEmpty()) {
+                this.allowProvincesSet.add(allowProvince.trim());
+            }
         }
         InputStream iptableInputStream = null;
         try {
             File iptablesFile = new File(dir, iptablesFileName);
+            this.lastIptablesModified = iptablesFile.lastModified();
             if (iptablesFile.exists()) {
                 iptableInputStream = new FileInputStream(iptablesFile);
                 iptables.load(iptableInputStream);
             } else {
-                log.error(MessageFormatter.format("please check iptables file is '{}'?", iptablesFile.getAbsolutePath()));
+                log.error(MessageFormatter.format("please check iptables.properties file is '{}'?", iptablesFile.getAbsolutePath()));
                 iptablesFile.createNewFile();
             }
         } catch (IOException e) {
@@ -254,12 +260,45 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
      * has changed since the previous log call.
      *
      * @param format Message to be logged
-     * @param args arges
+     * @param args   arges
      */
     public void log(final String format, final Object... args) {
         long systime = System.currentTimeMillis();
         if ((systime - rotationLastChecked) > 1000) {
+            File dir = new File(directory);
+            if (!dir.isAbsolute()) {
+                dir = new File(System.getProperty(Globals.CATALINA_BASE_PROP), directory);
+            }
+            if (!dir.mkdirs() && !dir.isDirectory()) {
+                log.error(sm.getString("flowlimit.openDirFail", dir));
+            }
             synchronized (this) {
+                File iptablesFile = new File(dir, iptablesFileName);
+                long lastIptablesModified = iptablesFile.lastModified();
+                //如果文件更新则进行热加载
+                if (lastIptablesModified - this.lastIptablesModified > 60 * 1000) {
+                    FileInputStream iptableInputStream = null;
+                    try {
+                        try {
+                            iptableInputStream = new FileInputStream(iptablesFile);
+                            iptables.clear();
+                            iptables.load(iptableInputStream);
+                            log.info("reload iptables.properties");
+                        } catch (FileNotFoundException e) {
+                            //nothing
+                        } catch (IOException e) {
+                            //nothing
+                        }
+                    } finally {
+                        if (iptableInputStream != null) {
+                            try {
+                                iptableInputStream.close();
+                            } catch (IOException e) {
+                                //nothing
+                            }
+                        }
+                    }
+                }
                 if ((systime - rotationLastChecked) > 1000) {
                     rotationLastChecked = systime;
                     String tsDate;
@@ -299,9 +338,10 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
 
     /**
      * 将一个IP添加到黑名单中
+     *
      * @param clientIp IP
      */
-    synchronized void addBlacklist(String clientIp){
+    synchronized void addBlacklist(String clientIp) {
         File dir = new File("conf");
         if (!dir.isAbsolute()) {
             dir = new File(System.getProperty(Globals.CATALINA_BASE_PROP), "conf");
@@ -319,7 +359,7 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
         } catch (IOException e) {
             //nothing
         } finally {
-            if (fos != null){
+            if (fos != null) {
                 try {
                     fos.close();
                 } catch (IOException e) {
@@ -328,12 +368,17 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
             }
         }
     }
+
     @Override
     public void invoke(Request request, Response response) throws IOException, ServletException {
         //获取客户端真实IP地址
         String clientIp = NetworkUtils.getClientIp(request);
         Jedis jedis = null;
         try {
+            int idx = clientIp.indexOf(",");
+            if (idx > -1) {
+                clientIp = clientIp.substring(0, idx).trim();
+            }
             String value = iptables.getProperty(clientIp);
             if (DENY.equals(value)) {
                 if ("true".equalsIgnoreCase(showDenyLog)) {
@@ -352,31 +397,32 @@ public class RedisFlowLimiterHandlerValve extends ValveBase {
 
             if (limit < this.maxThresholdPreMin) {
                 //未超过流量的，则放行
-            }else if (limit > this.maxThresholdPreMin && limit < 2 * this.maxThresholdPreMin && !ALLOW.equals(value)){//流量未阈值的已被至两倍之间，也不属于白名单中的，则直接返回
+            } else if (limit > this.maxThresholdPreMin && limit < 2 * this.maxThresholdPreMin && !ALLOW.equals(value)) {//流量未阈值的已被至两倍之间，也不属于白名单中的，则直接返回
                 log("{}, {}, cause limit deny {}", currentDataFormatter.format(new Date()), clientIp, limit);
                 response.setStatus(200);
                 return;
-            }else if (!ALLOW.equals(value)){//流量超过了阈值的两倍，也不属于白名单中的，则自动添加黑名单
+            } else if (!ALLOW.equals(value)) {//流量超过了阈值的两倍，也不属于白名单中的，则自动添加黑名单
                 log("{}, {}, cause limit deny {} auto add blacklist ", currentDataFormatter.format(new Date()), clientIp, limit);
                 //自动添加到黑名单中
                 addBlacklist(clientIp);
                 response.setStatus(200);
                 return;
-            }else{
+            } else {
                 //超过流量，但是为白名单
             }
             //检查源地址所属省，不为允许的则直接拒绝
-            if (ipDatabase != null) {
+            if (ipDatabase != null && !ALLOW.equals(value)) {
                 try {
                     BaseStation baseStation = ipDatabase.findBaseStation(clientIp, "CN");
                     if (!allowProvincesSet.isEmpty() && !allowProvincesSet.contains(baseStation.getRegionName().trim())) {
-                        log("{}, {} , cause '{}' is deny access!", currentDataFormatter.format(new Date()), clientIp, baseStation.getRegionName());
+                        log("{}, {} , cause '{}' access is deny!", currentDataFormatter.format(new Date()), clientIp, baseStation.getRegionName());
                         response.setStatus(200);
                         return;
                     }
+                    log("{}, {} , {} area user access success!", currentDataFormatter.format(new Date()), clientIp, baseStation.getRegionName());
                 } catch (Exception e) {
                     if (Boolean.parseBoolean(strictCheckIp)) {
-                        log("{}, {} , cause ip illegal and enabled strict check ip!", currentDataFormatter.format(new Date()), clientIp);
+                        log("{}, {} , cause ip is illegal and enabled strict check ip!", currentDataFormatter.format(new Date()), clientIp);
                         response.setStatus(200);
                         return;
                     }
